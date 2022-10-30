@@ -75,6 +75,10 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     //
     // https://devblogs.nvidia.com/easy-introduction-cuda-c-and-c/
     //
+    int array_size = N * sizeof(float);
+    cudaMalloc(&device_x, array_size);
+    cudaMalloc(&device_y, array_size);
+    cudaMalloc(&device_result, array_size);
         
     // start timing after allocation of device memory
     double startTime = CycleTimer::currentSeconds();
@@ -82,15 +86,21 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     //
     // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
     //
-
+    cudaMemcpy(device_x, xarray, array_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_y, yarray, array_size, cudaMemcpyHostToDevice);
+    
    
     // run CUDA kernel. (notice the <<< >>> brackets indicating a CUDA
     // kernel launch) Execution on the GPU occurs here.
+    double kernelStartTime = CycleTimer::currentSeconds();
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
+    cudaDeviceSynchronize();
+    double kernelEndTime = CycleTimer::currentSeconds();
 
     //
     // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
     //
+    cudaMemcpy(resultarray, device_result, array_size, cudaMemcpyDeviceToHost);
 
     
     // end timing after result has been copied back into host memory
@@ -104,11 +114,15 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
 
     double overallDuration = endTime - startTime;
     printf("Effective BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, GBPerSec(totalBytes, overallDuration));
+    double overallKernelDuration = kernelEndTime - kernelStartTime;
+    printf("Effective BW by CUDA saxpy (kernel only): %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallKernelDuration, GBPerSec(totalBytes, overallKernelDuration));
 
     //
     // CS149 TODO: free memory buffers on the GPU using cudaFree
     //
-    
+    cudaFree(device_x);
+    cudaFree(device_y);
+    cudaFree(device_result);
 }
 
 void printCudaInfo() {
