@@ -12,17 +12,17 @@
 // make a subsequent call to circleInBox().
 __device__ __inline__ int
 circleInBoxConservative(
-    float circleX, float circleY, float circleRadius,
-    float boxL, float boxR, float boxT, float boxB)
+    float circleX, float circleY, float circleRadiusX, float circleRadiusY,
+    float boxL, float boxR, float boxB, float boxT)
 {
 
     // expand box by circle radius.  Test if circle center is in the
     // expanded box.
 
-    if ( circleX >= (boxL - circleRadius) &&
-         circleX <= (boxR + circleRadius) &&
-         circleY >= (boxB - circleRadius) &&
-         circleY <= (boxT + circleRadius) ) {
+    if ( circleX >= (boxL - circleRadiusX) &&
+         circleX <= (boxR + circleRadiusX) &&
+         circleY >= (boxB - circleRadiusY) &&
+         circleY <= (boxT + circleRadiusY) ) {
         return 1;
     } else {
         return 0;

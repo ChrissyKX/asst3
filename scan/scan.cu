@@ -74,24 +74,28 @@ void exclusive_scan(int* input, int N, int* result)
     int num_threads_pblock = 0;
     int num_threads = N/2;
     int num_blocks = 0;
-    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+
+    cudaMemset(result + N - 1, 0, sizeof(int));
+    for (int two_d = 1; two_d <= N/4; two_d*=2) {
        
-	if (num_threads < THREADS_PER_BLOCK) {
+	if (num_threads - 1 < THREADS_PER_BLOCK) {
 	   num_blocks = 1;
-	   num_threads_pblock = num_threads;
+	   num_threads_pblock = num_threads - 1;
 	} else {
 	   num_threads_pblock = THREADS_PER_BLOCK;
-	   num_blocks = (num_threads + num_threads_pblock - 1) / num_threads_pblock;
+	   num_blocks = (num_threads - 1 + num_threads_pblock - 1) / num_threads_pblock;
 	}
 
 	int two_dplus1 = 2*two_d;
-        up_sweep_kernel<<<num_blocks, num_threads_pblock>>>(result, two_d, two_dplus1, num_threads);
+        up_sweep_kernel<<<num_blocks, num_threads_pblock>>>(result, two_d, two_dplus1, num_threads - 1);
 	cudaDeviceSynchronize();
 	num_threads /= 2; // reduce the number of Cuda threads
     }
     
-    int zero = 0;
-    cudaMemcpy(result + N - 1, &zero, sizeof(int), cudaMemcpyHostToDevice);
+    //int zero = 0;
+    
+    cudaDeviceSynchronize();
+    //cudaMemcpy(result + N - 1, &zero, sizeof(int), cudaMemcpyHostToDevice);
     //output[N-1] = 0;
 
     // downsweep phase

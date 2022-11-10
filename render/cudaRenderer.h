@@ -5,8 +5,7 @@
 #define uint unsigned int
 #endif
 
-#include "circleRenderer.h"
-
+#include "circleRenderer.h" 
 
 class CudaRenderer : public CircleRenderer {
 
@@ -26,7 +25,12 @@ private:
     float* cudaDeviceColor;
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
+    short* cudaDeviceCircleBox;
 
+  int* cudaDevicePixelCount;
+  int* cudaDevicePixel2Circle;
+  int* cudaDevicePixelCumCount;
+  
 public:
 
     CudaRenderer();

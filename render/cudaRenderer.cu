@@ -13,6 +13,8 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "cycleTimer.h"
+#include <typeinfo>
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -31,6 +33,9 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+    short* box;
+    int* pixelCount;
+    int* pixel2Circle;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -50,12 +55,19 @@ __constant__ float  cuConstNoise1DValueTable[256];
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
+// other rendering related state variables
+#define BLOCKSIZE 256
+#define SCAN_BLOCK_DIM BLOCKSIZE
+__device__ int cudaBatchStart = NULL;
+__device__ int cudaBatchEnd = NULL;
+__device__ int lastSum = 0;
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
-
+#include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -384,51 +396,48 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
+__global__ void kernelRenderCircles(int pixel_count, int batchStart, int* cudaDevicePixel2Circle) {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= pixel_count)
+       return;
 
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
+    // get circle index
+    int circle_index = cudaDevicePixel2Circle[index] + batchStart;
+    //if (circle_index >= cuConstRendererParams.numCircles) printf("%d %d %d- ", cudaDevicePixel2Circle[index], batchStart, pixel_count);
 
     // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+    float3 p = *(float3*)(&cuConstRendererParams.position[3 * circle_index]);
 
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+    short4 box = *(short4*)(&cuConstRendererParams.box[4 * circle_index]);
+    short screenBoxWidth = box.y - box.x;
+    short screenBoxHeight = box.w - box.z;
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    
+    int pixelY = index / screenBoxWidth + box.z;
+    int pixelX = index % screenBoxWidth + box.x;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
-        }
-    }
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+					 invHeight * (static_cast<float>(pixelY) + 0.5f));
+    shadePixel(circle_index, pixelCenterNorm, p, imgPtr);
 }
-
 ////////////////////////////////////////////////////////////////////////////////////////
 
+#define CHECK_LAST_CUDA_ERROR() checkLast(__FILE__, __LINE__)
+void checkLast(const char* const file, const int line)
+{
+    cudaError_t err{cudaGetLastError()};
+    if (err != cudaSuccess)
+    {
+        printf("CUDA Runtime Error at: %s: %d\n", file, line);
+	printf("%s\n", cudaGetErrorString(err));
+        // We don't exit when we encounter CUDA errors in this example.
+        // std::exit(EXIT_FAILURE);
+    }
+}
 
 CudaRenderer::CudaRenderer() {
     image = NULL;
@@ -444,7 +453,13 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+    cudaDeviceCircleBox = NULL;
+
+    cudaDevicePixelCount = NULL;
+    cudaDevicePixelCumCount = NULL;
+    cudaDevicePixel2Circle = NULL;
 }
+
 
 CudaRenderer::~CudaRenderer() {
 
@@ -465,6 +480,10 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+	cudaFree(cudaDeviceCircleBox);
+	cudaFree(cudaDevicePixelCount);
+	cudaFree(cudaDevicePixelCumCount);
+	cudaFree(cudaDevicePixel2Circle);
     }
 }
 
@@ -525,6 +544,10 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+    cudaMalloc(&cudaDeviceCircleBox, sizeof(short) * 4 * numCircles);
+    cudaMalloc(&cudaDevicePixelCount, sizeof(int) * numCircles);
+    cudaMalloc(&cudaDevicePixelCumCount, sizeof(int) * numCircles);
+    cudaMalloc(&cudaDevicePixel2Circle, sizeof(int) * image->width * image->height);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -549,8 +572,11 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+    params.box = cudaDeviceCircleBox;
+
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
+    
 
     // also need to copy over the noise lookup tables, so we can
     // implement noise on the GPU
@@ -574,7 +600,7 @@ CudaRenderer::setup() {
     };
 
     cudaMemcpyToSymbol(cuConstColorRamp, lookupTable, sizeof(float) * 3 * COLOR_MAP_SIZE);
-
+    CHECK_LAST_CUDA_ERROR();
 }
 
 // allocOutputImage --
@@ -633,13 +659,237 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+__global__ void
+computeBox() {
+    int circle_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circle_index >= cuConstRendererParams.numCircles)
+       return;
+       
+    float3 p = *(float3*)(&cuConstRendererParams.position[circle_index * 3]);
+    float  rad = cuConstRendererParams.radius[circle_index];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short4 box;
+    box.x = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    box.y = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    box.z = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    box.w = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    short4* boxPtr = (short4*)(&cuConstRendererParams.box[circle_index * 4]);
+    *boxPtr = box;			   
+}
+
+
+__device__ inline void
+scanHandle(int linearThreadIndex, int* input, int* output, int N, int last_sum) {
+   __shared__ uint prefixSumInput[BLOCKSIZE];
+   __shared__ uint prefixSumOutput[BLOCKSIZE];
+   __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+
+   prefixSumInput[linearThreadIndex] = input[linearThreadIndex];
+   if (linearThreadIndex == 0) {
+      prefixSumInput[linearThreadIndex] += last_sum;
+   }
+
+   __syncthreads();
+
+   sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+
+   __syncthreads();
+   
+   if (linearThreadIndex == 0) {
+      output[linearThreadIndex] = last_sum;
+   } else if (linearThreadIndex < N) {
+      output[linearThreadIndex] = prefixSumOutput[linearThreadIndex];
+   }
+   
+   if (linearThreadIndex == N - 1) {
+      lastSum = prefixSumOutput[linearThreadIndex] + prefixSumInput[linearThreadIndex];
+      //if (lastSum == 0) printf("k%d ", N);
+   }
+}
+
+
+// call with one 2 dimensional block at a time
+__global__ void
+scanHandleKernel(int* input, int* output, int N, int offset) { 
+   int linearThreadIndex =  blockIdx.x * blockDim.x + threadIdx.x;
+
+   scanHandle(linearThreadIndex, input + offset, output + offset, N, lastSum);
+}
+
+
+int scanHandleHost(int* input, int* output, int numElements) {
+   dim3 blockDim(BLOCKSIZE, 1);
+   int zero = 0;
+   cudaMemcpyToSymbol(lastSum, &zero, sizeof(int));
+   for (int scanned = 0; scanned < numElements; scanned += BLOCKSIZE) {
+       int N = numElements - scanned < BLOCKSIZE ? numElements - scanned : BLOCKSIZE;
+       scanHandleKernel<<<1, blockDim.x>>>(input, output, N, scanned);
+       cudaDeviceSynchronize();
+   }
+
+   int total_sum = 0;
+   cudaMemcpyFromSymbol(&total_sum, lastSum, sizeof(int));
+  // if (total_sum == 0) printf("ne%d ", numElements);
+   return total_sum;
+}
+
+// call with multiple 2 dimensional block (blockDim.y = 1)
+// numCircles threads
+__global__ void
+initPixel2Circle(int* pixelCumCount, int* cudaDevicePixel2Circle, int numCircles) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index > 0 && index < numCircles) {
+       cudaDevicePixel2Circle[pixelCumCount[index] - 1] = 1; 
+    }
+}
+
+int computePixel2Circle(int batchSize, int blockSize, int* cudaDevicePixelCount,
+     			     		     		int* cudaDevicePixelCumCount,
+							int* cudaDevicePixel2Circle) {
+     int total_pixel_count = scanHandleHost(cudaDevicePixelCount, cudaDevicePixelCumCount, batchSize);
+
+     dim3 blockDim(blockSize, 1);
+     dim3 gridDim((batchSize + blockDim.x - 1) / blockDim.x);
+     initPixel2Circle<<<gridDim, blockDim>>>(cudaDevicePixelCumCount,
+					     cudaDevicePixel2Circle,
+					     batchSize);
+     cudaDeviceSynchronize();
+     
+     scanHandleHost(cudaDevicePixel2Circle, cudaDevicePixel2Circle, total_pixel_count);
+     return total_pixel_count;
+}
+
+__global__ void
+createBatch(int* cudaDevicePixelCount) {
+    // Iterate through the circles until find a overlap, then batch
+    // compute those circles with a bulk launch of kernels. To handle
+    // the case when there is too much non-overlapping circles in a batch
+    // and this method degrades to a sequential execution, we define a max
+    // batch size of sqrt(numCircles)
+    
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index > 0) return;
+
+    int max_batch_size = 32;
+    int numCircles = cuConstRendererParams.numCircles;
+
+    while (cudaBatchEnd < cudaBatchStart + max_batch_size && cudaBatchEnd < numCircles) {
+	  float3 cur = *(float3*)(&cuConstRendererParams.position[cudaBatchEnd * 3]);
+	  float rad = cuConstRendererParams.radius[cudaBatchEnd];
+
+	  bool should_end = false;
+	  for (int i = cudaBatchStart; i < cudaBatchEnd; i++) {
+	      short4 box = *(short4*)(&cuConstRendererParams.box[i * 4]);
+	      cur.x *= cuConstRendererParams.imageWidth;
+	      cur.y *= cuConstRendererParams.imageHeight;
+	      int radX = rad * cuConstRendererParams.imageWidth;
+	      int radY = rad * cuConstRendererParams.imageHeight;
+	      if (circleInBoxConservative(cur.x, cur.y,
+					  radX, radY,
+					  box.x, box.y - 1, box.z, box.w - 1)) {
+	      	 should_end = true;
+		 break;
+	      }
+	  }
+
+	  if (should_end) {
+	      break;
+	  }
+	 
+	  short4 box = *(short4*)(&cuConstRendererParams.box[cudaBatchEnd * 4]);
+	  cudaDevicePixelCount[cudaBatchEnd - cudaBatchStart] = (box.y - box.x) * (box.w - box.z);
+ 	  cudaBatchEnd++;
+    }
+    
+}
+
+
 void
 CudaRenderer::render() {
+    double start = 0; double end = 0; double total = 0;
 
-    // 256 threads per block is a healthy number
+    // Compute Boxes
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    start = CycleTimer::currentSeconds();
+    computeBox<<<gridDim, blockDim>>>();
+    end = CycleTimer::currentSeconds();
+    printf("computeBox: %.3f\n", end - start); end = start = 0;
     cudaDeviceSynchronize();
+    CHECK_LAST_CUDA_ERROR();
+   
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    int batch_start = 0;
+    int batch_end = 0;
+    int last_batch_size = 0;
+    int last_pixel_count = 0;
+    int count = 0; 
+    while (batch_start < numCircles && count < 50) {
+    	  
+    	  cudaMemcpyToSymbol(cudaBatchStart, &batch_start, sizeof(int));
+	  
+	  createBatch<<<1, 1>>>(cudaDevicePixelCount);
+	  cudaDeviceSynchronize();
+	  CHECK_LAST_CUDA_ERROR();
+
+	  cudaMemcpyFromSymbol(&batch_end, cudaBatchEnd, sizeof(int));
+	  CHECK_LAST_CUDA_ERROR();
+	  // start = CycleTimer::currentSeconds();
+	  // Get pixel2Circle
+	  if (batch_end - batch_start > 0) 
+	  	  printf("%d %d- ", batch_start, batch_end);
+    	  cudaMemset(cudaDevicePixelCumCount, 0, numCircles * sizeof(int));
+     	  cudaMemset(cudaDevicePixel2Circle, 0, image->height * image->width * sizeof(int));
+	  int total_pixel_count =  computePixel2Circle(batch_end - batch_start,
+	      			   				  256,
+	      			   				  cudaDevicePixelCount,
+    			     	    	 		     	  cudaDevicePixelCumCount,
+					 			  cudaDevicePixel2Circle);
+          cudaMemset(cudaDevicePixelCount, 0, numCircles * sizeof(int));
+	  CHECK_LAST_CUDA_ERROR();
+	  //end = CycleTimer::currentSeconds(); total += end - start;
+
+         int out[total_pixel_count];
+         cudaMemcpy(&out, cudaDevicePixel2Circle, sizeof(int) * total_pixel_count, cudaMemcpyDeviceToHost);
+//	 printf("%d ", out[]);
+          for (int i = 0; i < total_pixel_count; i++) {
+		  if (out[i] > batch_end - batch_start)
+		  	exit(1);
+	  }
+	  start = CycleTimer::currentSeconds();
+       	  dim3 blockDim(256, 1);
+	  if (total_pixel_count > 0) printf("pixel count: %d ", total_pixel_count);
+	  int blockNum = (total_pixel_count + blockDim.x - 1) / blockDim.x;
+	  kernelRenderCircles<<<blockNum, blockDim>>>(total_pixel_count,
+	 					     batch_start,
+	 					     cudaDevicePixel2Circle);
+	  cudaDeviceSynchronize();
+	  end = CycleTimer::currentSeconds(); total += end - start;
+	 
+  	  CHECK_LAST_CUDA_ERROR();
+
+	  last_batch_size = batch_end - batch_start;
+	  last_pixel_count = total_pixel_count;
+	  batch_start = batch_end;
+	  count++;
+    }
+    printf("time: %.3f\n", total);
+    //float test[12];
+    //cudaMemcpy(&test, cudaDeviceCircleBox, 12 * 4, cudaMemcpyDeviceToHost);
+    //for (int i = 0; i < 12; i++)
+    //	printf("%hi ", box[i]);
+    //for (int i = 0; i < 12; i++)
+    //	printf("%.1f ", position[i]);
 }
