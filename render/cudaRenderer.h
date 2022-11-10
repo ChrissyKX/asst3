@@ -25,12 +25,7 @@ private:
     float* cudaDeviceColor;
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
-    short* cudaDeviceCircleBox;
 
-  int* cudaDevicePixelCount;
-  int* cudaDevicePixel2Circle;
-  int* cudaDevicePixelCumCount;
-  
 public:
 
     CudaRenderer();
