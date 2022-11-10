@@ -53,8 +53,9 @@ __constant__ float  cuConstNoise1DValueTable[256];
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 // other rendering related state variables
-#define BLOCKSIZE 256
+#define BLOCKSIZE 1024
 #define SCAN_BLOCK_DIM BLOCKSIZE
+__device__ int* cudaDeviceCircleBox;
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
@@ -323,8 +324,8 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+__device__ __inline__ float4
+computePixelColor(int circleIndex, float2 pixelCenter, float3 p, float4 existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -372,7 +373,6 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
@@ -380,7 +380,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     newColor.w = alpha + existingColor.w;
 
     // global memory write
-    *imagePtr = newColor;
+    return newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -631,8 +631,8 @@ computeBox() {
     box.z = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
     box.w = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
 
-    //short4* boxPtr = (short4*)(&cuConstRendererParams.box[circle_index * 4]);
-    //boxPtr = box;			   
+    short4* boxPtr = (short4*)(cudaDeviceCircleBox[circle_index * 4]);
+    *boxPtr = box;			   
 }
 
 __device__ inline int
@@ -667,7 +667,11 @@ regionWorker() {
     short regionB = static_cast<short>(blockIdx.y * blockDim.y);
     short regionR = static_cast<short>(regionL + blockDim.x > width ? width : regionL + blockDim.x);
     short regionT = static_cast<short>(regionB + blockDim.y > height ? height : regionB + blockDim.y);
-
+    float regionLf = (static_cast<float>(regionL) + 0.5f) * invWidth;     	
+    float regionRf = (static_cast<float>(regionR - 1) + 0.5f) * invWidth; 
+    float regionBf = (static_cast<float>(regionB) + 0.5f) * invHeight;
+    float regionTf = (static_cast<float>(regionT - 1) + 0.5f) * invHeight; 
+	    
     int indexX = regionL + threadIdx.x;
     int indexY = regionB + threadIdx.y;
     int blockIndex = threadIdx.y * blockDim.x + threadIdx.x; 
@@ -689,11 +693,7 @@ regionWorker() {
 	    float3 p = *(float3*)(&cuConstRendererParams.position[(base + blockIndex) * 3]);
             float  rad = cuConstRendererParams.radius[base + blockIndex];
        	    // check if circle is in region
-	    if (__circleInBoxConservative(p.x, p.y, rad,
-			    (static_cast<float>(regionL) + 0.5f) * invWidth, 
-			    (static_cast<float>(regionR - 1) + 0.5f) * invWidth, 
-             		    (static_cast<float>(regionB) + 0.5f) * invHeight,
-		            (static_cast<float>(regionT - 1) + 0.5f) * invHeight)) { 	    
+	    if (circleInBox(p.x, p.y, rad, regionLf, regionRf, regionTf, regionBf)) { 	    
     	        flags[blockIndex] = 1; 
     	    } 
 		//printf("block index: %d\n", blockIndex);
@@ -715,17 +715,18 @@ regionWorker() {
 	__syncthreads();
 
 	// each thread shade one pixel across every overlapping circles (within the image)
-	if (indexX < regionR && indexY < regionT) {
+	if (indexX < width && indexY < height) {
 	   
 	    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (indexY * width + indexX)]);   
        	    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(indexX) + 0.5f),
 				                     invHeight * (static_cast<float>(indexY) + 0.5f));
-            //if (indexX == 541 && indexY == 480) printf("%d, %d- ", numInBound); 
+	    float4 curColor = *imgPtr;
 	    for (int j = 0; j < numInBound; j++) {
 		int circle_index = denseIndex[j];
 		float3 p = *(float3*)(&cuConstRendererParams.position[circle_index * 3]);
-  		shadePixel(circle_index, pixelCenterNorm, p, imgPtr);
+		curColor = computePixelColor(circle_index, pixelCenterNorm, p, curColor);
 	    }
+	    *imgPtr = curColor;
 	}
         __syncthreads();
     } 
@@ -737,9 +738,8 @@ regionWorker() {
 void
 CudaRenderer::render() {
     double start = 0; double end = 0; double total = 0;
-
     
-    dim3 blockDim(16, 16);
+    dim3 blockDim(32, 32);
     dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x,
 		   (image->height + blockDim.y - 1) / blockDim.y);
     //dim3 gridDim(64, 48);
