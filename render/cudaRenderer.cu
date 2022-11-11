@@ -336,7 +336,7 @@ computePixelColor(int circleIndex, float2 pixelCenter, float3 p, float4 existing
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
-        return;
+        return existingColor;
 
     float3 rgb;
     float alpha;
@@ -383,6 +383,156 @@ computePixelColor(int circleIndex, float2 pixelCenter, float3 p, float4 existing
     return newColor;
 
     // END SHOULD-BE-ATOMIC REGION
+}
+
+__global__ void kernelRenderCircles(int index, short screenMinX, short screenMaxX, short screenMinY,short screenMaxY) {
+
+    int indexX = blockIdx.x * blockDim.x + threadIdx.x;
+    int indexY = blockIdx.y * blockDim.y + threadIdx.y;
+    int pixelX = screenMinX + indexX;
+    int pixelY = screenMinY + indexY;
+
+
+    if (pixelX >= screenMaxX|| pixelY >= screenMaxY)
+        return;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index * 3]);
+
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
+    *imgPtr = computePixelColor(index, pixelCenterNorm, p, *imgPtr);
+ 
+}
+
+__global__ void
+computeBox() {
+    int circle_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circle_index >= cuConstRendererParams.numCircles)
+       return;
+       
+    float3 p = *(float3*)(&cuConstRendererParams.position[circle_index * 3]);
+    float  rad = cuConstRendererParams.radius[circle_index];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short4 box;
+    box.x = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    box.y = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    box.z = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    box.w = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    short4* boxPtr = (short4*)(cudaDeviceCircleBox[circle_index * 4]);
+    *boxPtr = box;			   
+}
+
+__device__ inline int
+__circleInBoxConservative(
+		    float circleX, float circleY, float rad,
+		        float boxL, float boxR, float boxB, float boxT)
+{
+    // This function slightly modifies the given helper function
+    if ( circleX >= (boxL - rad) 
+	&& circleX <= (boxR + rad)
+	&& circleY >= (boxB - rad) 
+        && circleY <= (boxT + rad) ) {
+   	return 1;
+    }
+    return 0;
+}
+
+__global__ void
+regionWorker() {
+
+    //int index = (blockIdx.y * gridDim.x + blockIdx.x) * (blockDim.x * blockDim.y)
+	//	    + (threadIdx.y * blockDim.x + threadIdx.x);
+   int numCircles = cuConstRendererParams.numCircles;
+
+    // compute current region bounds
+    int width = cuConstRendererParams.imageWidth;
+    int height = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / width;  	     
+    float invHeight = 1.f / height;	     
+    
+    short regionL = static_cast<short>(blockIdx.x * blockDim.x);
+    short regionB = static_cast<short>(blockIdx.y * blockDim.y);
+    short regionR = static_cast<short>(regionL + blockDim.x > width ? width : regionL + blockDim.x);
+    short regionT = static_cast<short>(regionB + blockDim.y > height ? height : regionB + blockDim.y);
+    float regionLf = (static_cast<float>(regionL) + 0.5f) * invWidth;     	
+    float regionRf = (static_cast<float>(regionR - 1) + 0.5f) * invWidth; 
+    float regionBf = (static_cast<float>(regionB) + 0.5f) * invHeight;
+    float regionTf = (static_cast<float>(regionT - 1) + 0.5f) * invHeight; 
+	    
+    int indexX = regionL + threadIdx.x;
+    int indexY = regionB + threadIdx.y;
+    int blockIndex = threadIdx.y * blockDim.x + threadIdx.x; 
+
+    __shared__ uint flags[BLOCKSIZE];
+    __shared__ uint sparseIndex[BLOCKSIZE];
+    __shared__ uint scratch[2*BLOCKSIZE];
+    __shared__ uint denseIndex[BLOCKSIZE];
+    for (int base = 0; base < numCircles; base += BLOCKSIZE) {
+	// zero things out before start
+	flags[blockIndex] = 0;
+	sparseIndex[blockIndex] = 0;
+	scratch[2*blockIndex] = 0;
+	scratch[2*blockIndex + 1] = 0;
+	denseIndex[blockIndex] = 0;
+
+	// check which circles are in this region
+        if (base + blockIndex < numCircles) {
+	    float3 p = *(float3*)(&cuConstRendererParams.position[(base + blockIndex) * 3]);
+            float  rad = cuConstRendererParams.radius[base + blockIndex];
+       	    // check if circle is in region
+	    if (circleInBox(p.x, p.y, rad, regionLf, regionRf, regionTf, regionBf)) { 	    
+    	        flags[blockIndex] = 1; 
+    	    } 
+		//printf("block index: %d\n", blockIndex);
+	}
+ 
+        __syncthreads();
+        
+	sharedMemExclusiveScan(blockIndex, flags, sparseIndex, scratch, BLOCKSIZE);
+	__syncthreads();
+
+	int numInBound = sparseIndex[BLOCKSIZE - 1];
+	if (flags[BLOCKSIZE - 1] == 1) numInBound++;
+	
+	if (flags[blockIndex] == 1) {
+	    denseIndex[sparseIndex[blockIndex]] = base + blockIndex;
+ 	}
+	__syncthreads();
+
+	// each thread shade one pixel across every overlapping circles (within the image)
+	if (indexX < width && indexY < height) {
+	   
+	    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (indexY * width + indexX)]);   
+       	    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(indexX) + 0.5f),
+				                     invHeight * (static_cast<float>(indexY) + 0.5f));
+	    float4 curColor = *imgPtr;
+	    for (int j = 0; j < numInBound; j++) {
+		int circle_index = denseIndex[j];
+		float3 p = *(float3*)(&cuConstRendererParams.position[circle_index * 3]);
+		curColor = computePixelColor(circle_index, pixelCenterNorm, p, curColor);
+	    }
+	    *imgPtr = curColor;
+	}
+        __syncthreads();
+    } 
+    
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -606,133 +756,6 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
-__global__ void
-computeBox() {
-    int circle_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (circle_index >= cuConstRendererParams.numCircles)
-       return;
-       
-    float3 p = *(float3*)(&cuConstRendererParams.position[circle_index * 3]);
-    float  rad = cuConstRendererParams.radius[circle_index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short4 box;
-    box.x = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    box.y = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    box.z = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    box.w = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    short4* boxPtr = (short4*)(cudaDeviceCircleBox[circle_index * 4]);
-    *boxPtr = box;			   
-}
-
-__device__ inline int
-__circleInBoxConservative(
-		    float circleX, float circleY, float rad,
-		        float boxL, float boxR, float boxB, float boxT)
-{
-    // This function slightly modifies the given helper function
-    if ( circleX >= (boxL - rad) 
-	&& circleX <= (boxR + rad)
-	&& circleY >= (boxB - rad) 
-        && circleY <= (boxT + rad) ) {
-   	return 1;
-    }
-    return 0;
-}
-
-__global__ void
-regionWorker() {
-
-    //int index = (blockIdx.y * gridDim.x + blockIdx.x) * (blockDim.x * blockDim.y)
-	//	    + (threadIdx.y * blockDim.x + threadIdx.x);
-   int numCircles = cuConstRendererParams.numCircles;
-
-    // compute current region bounds
-    int width = cuConstRendererParams.imageWidth;
-    int height = cuConstRendererParams.imageHeight;
-    float invWidth = 1.f / width;  	     
-    float invHeight = 1.f / height;	     
-    
-    short regionL = static_cast<short>(blockIdx.x * blockDim.x);
-    short regionB = static_cast<short>(blockIdx.y * blockDim.y);
-    short regionR = static_cast<short>(regionL + blockDim.x > width ? width : regionL + blockDim.x);
-    short regionT = static_cast<short>(regionB + blockDim.y > height ? height : regionB + blockDim.y);
-    float regionLf = (static_cast<float>(regionL) + 0.5f) * invWidth;     	
-    float regionRf = (static_cast<float>(regionR - 1) + 0.5f) * invWidth; 
-    float regionBf = (static_cast<float>(regionB) + 0.5f) * invHeight;
-    float regionTf = (static_cast<float>(regionT - 1) + 0.5f) * invHeight; 
-	    
-    int indexX = regionL + threadIdx.x;
-    int indexY = regionB + threadIdx.y;
-    int blockIndex = threadIdx.y * blockDim.x + threadIdx.x; 
-
-    __shared__ uint flags[BLOCKSIZE];
-    __shared__ uint sparseIndex[BLOCKSIZE];
-    __shared__ uint scratch[2*BLOCKSIZE];
-    __shared__ uint denseIndex[BLOCKSIZE];
-    for (int base = 0; base < numCircles; base += BLOCKSIZE) {
-	// zero things out before start
-	flags[blockIndex] = 0;
-	sparseIndex[blockIndex] = 0;
-	scratch[2*blockIndex] = 0;
-	scratch[2*blockIndex + 1] = 0;
-	denseIndex[blockIndex] = 0;
-
-	// check which circles are in this region
-        if (base + blockIndex < numCircles) {
-	    float3 p = *(float3*)(&cuConstRendererParams.position[(base + blockIndex) * 3]);
-            float  rad = cuConstRendererParams.radius[base + blockIndex];
-       	    // check if circle is in region
-	    if (circleInBox(p.x, p.y, rad, regionLf, regionRf, regionTf, regionBf)) { 	    
-    	        flags[blockIndex] = 1; 
-    	    } 
-		//printf("block index: %d\n", blockIndex);
-	}
- 
-        __syncthreads();
-        
-	sharedMemExclusiveScan(blockIndex, flags, sparseIndex, scratch, BLOCKSIZE);
-	__syncthreads();
-
-	int numInBound = sparseIndex[BLOCKSIZE - 1];
-	if (flags[BLOCKSIZE - 1] == 1) numInBound++;
-	
-	if (flags[blockIndex] == 1) {
-	    denseIndex[sparseIndex[blockIndex]] = base + blockIndex;
- 	     //printf("%d ", numInBound);
-	    // printf("dense index: %d, circle index: %d\n", sparseIndex[blockIndex], base + blockIndex);
-	}
-	__syncthreads();
-
-	// each thread shade one pixel across every overlapping circles (within the image)
-	if (indexX < width && indexY < height) {
-	   
-	    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (indexY * width + indexX)]);   
-       	    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(indexX) + 0.5f),
-				                     invHeight * (static_cast<float>(indexY) + 0.5f));
-	    float4 curColor = *imgPtr;
-	    for (int j = 0; j < numInBound; j++) {
-		int circle_index = denseIndex[j];
-		float3 p = *(float3*)(&cuConstRendererParams.position[circle_index * 3]);
-		curColor = computePixelColor(circle_index, pixelCenterNorm, p, curColor);
-	    }
-	    *imgPtr = curColor;
-	}
-        __syncthreads();
-    } 
-    
-}
-
 
 
 void
@@ -742,8 +765,35 @@ CudaRenderer::render() {
     dim3 blockDim(32, 32);
     dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x,
 		   (image->height + blockDim.y - 1) / blockDim.y);
-    //dim3 gridDim(64, 48);
-    regionWorker<<<gridDim, blockDim>>>();
+    
+    if (numCircles <= 3) {
+	// if very few circles, might be better to render them sequentially
+	for (int i = 0; i < numCircles; i++) {
+		
+    	 // compute the bounding box of the circle. The bound is in integer
+	 // screen coordinates, so it's clamped to the edges of the screen.
+	    short imageWidth = image->width;
+	    short imageHeight = image->height;
+	    short minX = static_cast<short>(imageWidth * (position[i * 3] - radius[i]));
+	    short maxX = static_cast<short>(imageWidth * (position[i * 3] + radius[i])) + 1;
+	    short minY = static_cast<short>(imageHeight * (position[i * 3 + 1] - radius[i]));
+	    short maxY = static_cast<short>(imageHeight * (position[i * 3 + 1] + radius[i])) + 1;
+
+	    // a bunch of clamps.  Is there a CUDA built-in for this?
+	    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+	    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+	    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+	    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+	
+	    dim3 gridDim((screenMaxX - screenMinX + blockDim.x - 1) / blockDim.x,
+			    (screenMaxY - screenMinY + blockDim.y - 1) / blockDim.y);
+	    kernelRenderCircles<<<gridDim, blockDim>>>(i, screenMinX, screenMaxX, screenMinY, screenMaxY);
+	}
+    } else {
+	// otherwise, render in parallel    
+    	regionWorker<<<gridDim, blockDim>>>();
+    }
+
     cudaDeviceSynchronize();
     CHECK_LAST_CUDA_ERROR();
 }
